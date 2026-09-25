@@ -1,0 +1,130 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'com.google.devtools.ksp'
+}
+
+android {
+    namespace 'com.agrishield.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.agrishield.app"
+        minSdk 24
+        targetSdk 34
+        versionCode 4
+        versionName "4.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        vectorDrawables { useSupportLibrary true }
+
+        // Gemini API key — set this in gradle.properties as: GEMINI_API_KEY=your_key_here
+        def geminiKey = project.findProperty("GEMINI_API_KEY") ?: "YOUR_GEMINI_API_KEY"
+        buildConfigField "String", "GEMINI_API_KEY", "\"${geminiKey}\""
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+
+    buildFeatures {
+        compose true
+        buildConfig true
+    }
+    composeOptions {
+        kotlinCompilerExtensionVersion '1.5.13'
+    }
+    packaging {
+        resources { excludes += '/META-INF/{AL2.0,LGPL2.1}' }
+    }
+
+    // Keep TFLite model file uncompressed so it can be memory-mapped on device
+    aaptOptions {
+        noCompress "tflite"
+    }
+
+    // 16KB page size alignment for Android 15+ Samsung devices
+    packaging {
+        jniLibs {
+            useLegacyPackaging false
+        }
+    }
+}
+
+dependencies {
+    def composeBom = platform('androidx.compose:compose-bom:2024.05.00')
+    implementation composeBom
+
+    // Compose UI
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.ui:ui-graphics'
+    implementation 'androidx.compose.ui:ui-tooling-preview'
+    implementation 'androidx.compose.material3:material3'
+    // Use core icons only — extended is 34 MB and causes OOM during build
+    implementation 'androidx.compose.material:material-icons-core'
+    implementation 'androidx.activity:activity-compose:1.9.0'
+    implementation 'androidx.navigation:navigation-compose:2.7.7'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.7.0'
+
+    // CameraX
+    def camerax = '1.3.3'
+    implementation "androidx.camera:camera-core:$camerax"
+    implementation "androidx.camera:camera-camera2:$camerax"
+    implementation "androidx.camera:camera-lifecycle:$camerax"
+    implementation "androidx.camera:camera-view:$camerax"
+
+    // TFLite — real on-device ML inference (CPU only — stable across all devices)
+    implementation 'org.tensorflow:tensorflow-lite:2.14.0'
+    implementation 'org.tensorflow:tensorflow-lite-support:0.4.4'
+
+    // Location (GPS)
+    implementation 'com.google.android.gms:play-services-location:21.2.0'
+
+    // Room (offline-first local database)
+    def room = '2.6.1'
+    implementation "androidx.room:room-runtime:$room"
+    implementation "androidx.room:room-ktx:$room"
+    ksp "androidx.room:room-compiler:$room"
+
+    // WorkManager (background sync when connectivity returns)
+    implementation 'androidx.work:work-runtime-ktx:2.9.0'
+
+    // Retrofit + OkHttp (API calls when online)
+    implementation 'com.squareup.retrofit2:retrofit:2.11.0'
+    implementation 'com.squareup.retrofit2:converter-gson:2.11.0'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'com.squareup.okhttp3:logging-interceptor:4.12.0'
+
+    // Coil (image loading in Compose)
+    implementation 'io.coil-kt:coil-compose:2.6.0'
+
+    // Permissions helper
+    implementation 'com.google.accompanist:accompanist-permissions:0.34.0'
+
+    // OSM-based map (lightweight, no API key)
+    implementation 'org.osmdroid:osmdroid-android:6.1.18'
+
+    // Datastore (preferences — language, auth token)
+    implementation 'androidx.datastore:datastore-preferences:1.1.1'
+
+    // Kotlin coroutines
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.0'
+
+    // Gson
+    implementation 'com.google.code.gson:gson:2.10.1'
+
+    // Debug
+    debugImplementation 'androidx.compose.ui:ui-tooling'
+    debugImplementation 'androidx.compose.ui:ui-test-manifest'
+}

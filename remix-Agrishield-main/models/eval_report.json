@@ -1,0 +1,39 @@
+{
+  "diseased cotton leaf": {
+    "precision": 1.0,
+    "recall": 0.84,
+    "f1-score": 0.9130434782608695,
+    "support": 25.0
+  },
+  "diseased cotton plant": {
+    "precision": 0.9310344827586207,
+    "recall": 0.9642857142857143,
+    "f1-score": 0.9473684210526315,
+    "support": 28.0
+  },
+  "fresh cotton leaf": {
+    "precision": 0.8387096774193549,
+    "recall": 1.0,
+    "f1-score": 0.9122807017543859,
+    "support": 26.0
+  },
+  "fresh cotton plant": {
+    "precision": 0.96,
+    "recall": 0.8888888888888888,
+    "f1-score": 0.9230769230769231,
+    "support": 27.0
+  },
+  "accuracy": 0.9245283018867925,
+  "macro avg": {
+    "precision": 0.9324360400444939,
+    "recall": 0.9232936507936508,
+    "f1-score": 0.9239423810362026,
+    "support": 106.0
+  },
+  "weighted avg": {
+    "precision": 0.932032237076836,
+    "recall": 0.9245283018867925,
+    "f1-score": 0.9244790369310034,
+    "support": 106.0
+  }
+}

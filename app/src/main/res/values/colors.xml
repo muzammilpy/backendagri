@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="dark_bg">#FF071E16</color>
+    <color name="emerald_500">#FF10B981</color>
+    <color name="emerald_900">#FF064E3B</color>
+    <color name="danger_red">#FFEF4444</color>
+    <color name="warn_amber">#FFF59E0B</color>
+</resources>

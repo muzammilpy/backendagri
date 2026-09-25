@@ -1,0 +1,8 @@
+{
+  "name": "Remix Agrishield",
+  "description": "Farmer \u0026 extension crop-health system with AI symptom diagnosis, pest trap tracking, weather risk forecasting, geospatial hotspots, and IPM advisories.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

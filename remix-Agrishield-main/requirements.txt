@@ -1,0 +1,15 @@
+# AgriShield Python Core
+# Note: agrishield.py runs with ZERO dependencies on standard Python 3.8+!
+# The packages below are optional if you want FastAPI REST endpoints or Streamlit dashboards:
+
+# Optional: Enhanced HTTP requests & Google GenAI SDK
+requests>=2.31.0
+google-genai>=0.1.0
+
+# Optional: Production REST API deployment
+fastapi>=0.110.0
+uvicorn>=0.28.0
+pydantic>=2.6.0
+
+# Optional: Streamlit web application
+streamlit>=1.32.0

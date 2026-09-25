@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Deep glossy emerald background -->
+    <path
+        android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54"
+                android:startY="0"
+                android:endX="54"
+                android:endY="108"
+                android:type="linear">
+                <item android:color="#0D472B" android:offset="0.0" />
+                <item android:color="#082818" android:offset="0.4" />
+                <item android:color="#04180E" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Ambient Top Radial Highlight Glow -->
+    <path
+        android:pathData="M0,0h108v60h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54"
+                android:startY="0"
+                android:endX="54"
+                android:endY="60"
+                android:type="linear">
+                <item android:color="#3584F379" android:offset="0.0" />
+                <item android:color="#00000000" android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Subtle Rounded Card Glow Ring -->
+    <path
+        android:strokeColor="#2086EFAC"
+        android:strokeWidth="1.5"
+        android:pathData="M18,12 L90,12 A6,6 0 0 1 96,18 L96,90 A6,6 0 0 1 90,96 L18,96 A6,6 0 0 1 12,90 L12,18 A6,6 0 0 1 18,12 Z" />
+
+</vector>

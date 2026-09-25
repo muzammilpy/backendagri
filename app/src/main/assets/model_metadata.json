@@ -1,0 +1,60 @@
+{
+  "model_version": "2.0",
+  "input_size": 224,
+  "classes": {
+    "0": {
+      "label": "diseased cotton leaf",
+      "display_name": "Diseased Cotton Leaf",
+      "marathi": "रोगग्रस्त कापूस पान",
+      "hindi": "रोगग्रस्त कपास पत्ती",
+      "severity": "HIGH",
+      "immediate_action": "Isolate affected section. Apply Trichoderma viride 5g/L. Scout 20 plants/acre.",
+      "likely_causes": [
+        "Alternaria leaf spot",
+        "Grey mildew",
+        "Bacterial blight",
+        "Nutrient deficiency"
+      ],
+      "chemical": "Mancozeb 75 WP 2.0g/L PHI 5 days",
+      "biological": "Trichoderma viride 5g/L + Pseudomonas fluorescens 2g/L"
+    },
+    "1": {
+      "label": "diseased cotton plant",
+      "display_name": "Diseased Cotton Plant",
+      "marathi": "रोगग्रस्त कापूस रोप",
+      "hindi": "रोगग्रस्त कपास पौधा",
+      "severity": "CRITICAL",
+      "immediate_action": "Entire plant infected. Check stem = Fusarium wilt; rosette flowers = Pink Bollworm; leaf curl = Whitefly CLCuV. Uproot severely wilted plants.",
+      "likely_causes": [
+        "Fusarium wilt",
+        "Pink Bollworm",
+        "Whitefly CLCuV",
+        "Helicoverpa bollworm"
+      ],
+      "chemical": "Chlorantraniliprole 18.5% SC 0.3ml/L PHI 21 days (pest) OR Cymoxanil+Mancozeb 2g/L (fungal)",
+      "biological": "Trichogramma bactrae 60000/acre + Gossyplure pheromone traps 8/acre"
+    },
+    "2": {
+      "label": "fresh cotton leaf",
+      "display_name": "Healthy Cotton Leaf",
+      "marathi": "निरोगी कापूस पान",
+      "hindi": "स्वस्थ कपास पत्ती",
+      "severity": "LOW",
+      "immediate_action": "Plant healthy. Scout every 7 days. Check pheromone trap ETL (8 moths/night = action threshold).",
+      "likely_causes": [],
+      "chemical": "No intervention needed",
+      "biological": "Preventive NSKE 5% spray as per schedule"
+    },
+    "3": {
+      "label": "fresh cotton plant",
+      "display_name": "Healthy Cotton Plant",
+      "marathi": "निरोगी कापूस रोप",
+      "hindi": "स्वस्थ कपास पौधा",
+      "severity": "LOW",
+      "immediate_action": "Plant healthy. Continue NPK fertilizer schedule. Scout 20 plants/acre weekly.",
+      "likely_causes": [],
+      "chemical": "No intervention",
+      "biological": "Release Trichogramma 50000/acre as routine biocontrol"
+    }
+  }
+}

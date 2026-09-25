@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AgriShield</string>
+    <string name="camera_permission_rationale">Camera permission is needed to capture leaf photos for disease diagnosis</string>
+    <string name="location_permission_rationale">Location permission is needed to get weather data for your exact farm location</string>
+    <string name="model_not_found">Model file not found. Run train_model.py and copy agrishield_cotton.tflite to app/src/main/assets/</string>
+</resources>

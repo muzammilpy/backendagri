@@ -1,0 +1,32 @@
+# Gradle
+.gradle/
+build/
+**/build/
+*.apk
+*.aab
+
+# API Keys — NEVER commit these
+gradle.properties
+local.properties
+*.env
+.env*
+
+# Android
+*.keystore
+*.jks
+android.keystore
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Python training artifacts
+remix-Agrishield-main/data/
+remix-Agrishield-main/models/best_*.keras
+remix-Agrishield-main/agrishield.db
+remix-Agrishield-main/__pycache__/
+
+# TFLite model — too large for GitHub (>10MB)
+# Regenerate with: python train_model.py
+app/src/main/assets/agrishield_cotton.tflite
