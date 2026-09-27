@@ -24,6 +24,7 @@ import json
 import base64
 import sqlite3
 import hashlib
+import hmac
 import secrets
 import argparse
 import datetime
@@ -45,6 +46,28 @@ import webbrowser
 
 DB_FILE_PATH = "agrishield.db"
 _db_lock = threading.Lock()
+
+# ============================================================================
+# JWT SECRET STARTUP GUARD (Requirement 5.5)
+# In production (AGRISHIELD_PROD=1) the server refuses to start without the
+# secret.  In development a default insecure secret is used with a warning.
+# ============================================================================
+_JWT_SECRET = os.environ.get("AGRISHIELD_JWT_SECRET", "")
+if not _JWT_SECRET:
+    if os.environ.get("AGRISHIELD_PROD") == "1":
+        print(
+            "ERROR: AGRISHIELD_JWT_SECRET environment variable is not set. "
+            "Refusing to start in production mode.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    else:
+        _JWT_SECRET = "dev-only-insecure-secret-change-before-production"
+        print(
+            "WARNING: AGRISHIELD_JWT_SECRET not set. Using insecure dev secret. "
+            "Set this env var before deploying.",
+            file=sys.stderr,
+        )
 
 # ============================================================================
 # 1. DOMAIN MODELS & ENUMS
@@ -217,8 +240,12 @@ class UserRecord:
     role: UserRole
     district: str
     pin_hash: str
-    created_at: str
-    session_token: Optional[str] = None
+    pin_salt: str = ""           # hex-encoded 16-byte salt
+    token_version: int = 0       # incremented on PIN change
+    failed_attempts: int = 0     # consecutive wrong PIN attempts
+    locked_until: Optional[str] = None  # ISO 8601 UTC or None
+    created_at: str = ""
+    session_token: Optional[str] = None  # kept for backward compat, not used
 
 
 # ============================================================================
@@ -237,8 +264,17 @@ class Database:
 
     @classmethod
     def init(cls):
+        """Initialise all database tables and run incremental schema migrations.
+
+        Creates base tables if they do not exist, then applies ALTER TABLE
+        migrations for new columns using try/except so that the method is safe
+        to call on both fresh and already-migrated databases.
+        """
         with _db_lock:
             conn = cls.get_conn()
+            # ------------------------------------------------------------------
+            # Base tables
+            # ------------------------------------------------------------------
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id TEXT PRIMARY KEY,
@@ -299,8 +335,64 @@ class Database:
                     reports_this_week INTEGER NOT NULL DEFAULT 0,
                     last_updated TEXT NOT NULL
                 );
+
+                -- New tables for feedback-driven learning loop (Requirement 2)
+                CREATE TABLE IF NOT EXISTS rule_weights (
+                    disease_id   TEXT PRIMARY KEY,
+                    weight       REAL NOT NULL DEFAULT 1.0,
+                    last_updated TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS rule_weight_history (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    disease_id TEXT NOT NULL,
+                    old_weight REAL NOT NULL,
+                    new_weight REAL NOT NULL,
+                    logged_at  TEXT NOT NULL
+                );
+
+                -- NDVI cache for dynamic GIS hotspot computation (Requirement 3)
+                CREATE TABLE IF NOT EXISTS ndvi_cache (
+                    district_name TEXT PRIMARY KEY,
+                    ndvi_value    REAL NOT NULL,
+                    ndvi_source   TEXT NOT NULL,
+                    fetched_at    TEXT NOT NULL
+                );
+
+                -- Background retrain task tracking (Requirement 2)
+                CREATE TABLE IF NOT EXISTS retrain_tasks (
+                    task_id        TEXT PRIMARY KEY,
+                    status         TEXT NOT NULL,
+                    started_at     TEXT NOT NULL,
+                    completed_at   TEXT,
+                    final_accuracy REAL,
+                    error_message  TEXT
+                );
             """)
             conn.commit()
+
+            # ------------------------------------------------------------------
+            # Incremental column migrations — SQLite does not support
+            # ADD COLUMN IF NOT EXISTS, so we catch the OperationalError that
+            # fires when a column already exists and move on.
+            # ------------------------------------------------------------------
+            _migrations = [
+                # users table — secure auth columns (Requirement 5)
+                "ALTER TABLE users ADD COLUMN pin_salt TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN locked_until TEXT",
+                # feedback_learning — diagnosis foreign-key reference (Requirement 2)
+                "ALTER TABLE feedback_learning ADD COLUMN diagnosis_id TEXT",
+            ]
+            for sql in _migrations:
+                try:
+                    conn.execute(sql)
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    # Column already exists — safe to ignore
+                    pass
+
             conn.close()
 
     @classmethod
@@ -477,37 +569,84 @@ class Database:
         with _db_lock:
             conn = cls.get_conn()
             conn.execute("""
-                INSERT OR REPLACE INTO users VALUES(?,?,?,?,?,?,?,?)
+                INSERT OR REPLACE INTO users 
+                (user_id, name, phone, role, district, pin_hash, pin_salt,
+                 token_version, failed_attempts, locked_until, created_at, session_token)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """, (user.user_id, user.name, user.phone, user.role.value,
-                  user.district, user.pin_hash, user.created_at, user.session_token))
+                  user.district, user.pin_hash, user.pin_salt,
+                  user.token_version, user.failed_attempts, user.locked_until,
+                  user.created_at, None))  # session_token always NULL now
             conn.commit()
             conn.close()
 
     @classmethod
-    def get_user_by_phone(cls, phone: str) -> Optional[UserRecord]:
+    def _row_to_user(cls, r) -> "UserRecord":
+        return UserRecord(
+            user_id=r["user_id"], name=r["name"], phone=r["phone"],
+            role=UserRole(r["role"]), district=r["district"],
+            pin_hash=r["pin_hash"],
+            pin_salt=r["pin_salt"] if r["pin_salt"] else "",
+            token_version=r["token_version"] if r["token_version"] is not None else 0,
+            failed_attempts=r["failed_attempts"] if r["failed_attempts"] is not None else 0,
+            locked_until=r["locked_until"],
+            created_at=r["created_at"]
+        )
+
+    @classmethod
+    def get_user_by_phone(cls, phone: str) -> Optional["UserRecord"]:
         with _db_lock:
             conn = cls.get_conn()
             r = conn.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
             conn.close()
         if not r:
             return None
-        return UserRecord(user_id=r["user_id"], name=r["name"], phone=r["phone"],
-                          role=UserRole(r["role"]), district=r["district"],
-                          pin_hash=r["pin_hash"], created_at=r["created_at"],
-                          session_token=r["session_token"])
+        return cls._row_to_user(r)
 
     @classmethod
-    def get_user_by_token(cls, token: str) -> Optional[UserRecord]:
+    def get_user_by_token(cls, token: str) -> Optional["UserRecord"]:
         with _db_lock:
             conn = cls.get_conn()
             r = conn.execute("SELECT * FROM users WHERE session_token=?", (token,)).fetchone()
             conn.close()
         if not r:
             return None
-        return UserRecord(user_id=r["user_id"], name=r["name"], phone=r["phone"],
-                          role=UserRole(r["role"]), district=r["district"],
-                          pin_hash=r["pin_hash"], created_at=r["created_at"],
-                          session_token=r["session_token"])
+        return cls._row_to_user(r)
+
+    @classmethod
+    def get_user_by_phone_or_id(cls, user_id_or_phone: str) -> Optional["UserRecord"]:
+        with _db_lock:
+            conn = cls.get_conn()
+            r = conn.execute(
+                "SELECT * FROM users WHERE user_id=? OR phone=?",
+                (user_id_or_phone, user_id_or_phone)
+            ).fetchone()
+            conn.close()
+        if not r:
+            return None
+        return cls._row_to_user(r)
+
+    @classmethod
+    def record_failed_attempt(cls, phone: str, attempts: int, locked_until: Optional[str]):
+        with _db_lock:
+            conn = cls.get_conn()
+            conn.execute(
+                "UPDATE users SET failed_attempts=?, locked_until=? WHERE phone=?",
+                (attempts, locked_until, phone)
+            )
+            conn.commit()
+            conn.close()
+
+    @classmethod
+    def reset_failed_attempts(cls, phone: str):
+        with _db_lock:
+            conn = cls.get_conn()
+            conn.execute(
+                "UPDATE users SET failed_attempts=0, locked_until=NULL WHERE phone=?",
+                (phone,)
+            )
+            conn.commit()
+            conn.close()
 
     @classmethod
     def update_user_token(cls, phone: str, token: str):
@@ -517,60 +656,544 @@ class Database:
             conn.commit()
             conn.close()
 
-
-# ============================================================================
-# 3. AUTH SERVICE (FIX 4: Role-based auth - Farmer/Extension Officer/Official)
-# ============================================================================
-
-class AuthService:
-    @staticmethod
-    def hash_pin(pin: str) -> str:
-        return hashlib.sha256(pin.encode()).hexdigest()
+    # ------------------------------------------------------------------
+    # NDVI cache helpers (Requirement 3)
+    # ------------------------------------------------------------------
 
     @classmethod
-    def register(cls, name: str, phone: str, pin: str, role: UserRole, district: str) -> UserRecord:
+    def get_ndvi_cache(cls, district_name: str) -> Optional[dict]:
+        """Return the cached NDVI row for *district_name* or None if absent.
+
+        Args:
+            district_name (str): Name of the Maharashtra district.
+
+        Returns:
+            Optional[dict]: A dict with keys district_name, ndvi_value,
+                ndvi_source, fetched_at, or None if no cache entry exists.
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            r = conn.execute(
+                "SELECT * FROM ndvi_cache WHERE district_name=?",
+                (district_name,),
+            ).fetchone()
+            conn.close()
+        if not r:
+            return None
+        return dict(r)
+
+    @classmethod
+    def update_ndvi_cache(cls, district_name: str, ndvi_value: float, ndvi_source: str):
+        """Upsert an NDVI entry for *district_name* with the current UTC time.
+
+        Args:
+            district_name (str): Name of the Maharashtra district.
+            ndvi_value (float): NDVI index value in [-1.0, 1.0].
+            ndvi_source (str): One of 'live', 'cache', or 'default'.
+        """
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        with _db_lock:
+            conn = cls.get_conn()
+            conn.execute(
+                """
+                INSERT INTO ndvi_cache(district_name, ndvi_value, ndvi_source, fetched_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(district_name) DO UPDATE SET
+                    ndvi_value = excluded.ndvi_value,
+                    ndvi_source = excluded.ndvi_source,
+                    fetched_at = excluded.fetched_at
+                """,
+                (district_name, ndvi_value, ndvi_source, now),
+            )
+            conn.commit()
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Rule weight helpers (Requirement 2)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def get_rule_weight(cls, disease_id: str) -> float:
+        """Return the stored Rule_Weight for *disease_id*, defaulting to 1.0.
+
+        Args:
+            disease_id (str): Unique disease identifier used by the Rule_Engine.
+
+        Returns:
+            float: Weight in [0.5, 2.0] or 1.0 if no record exists.
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            r = conn.execute(
+                "SELECT weight FROM rule_weights WHERE disease_id=?",
+                (disease_id,),
+            ).fetchone()
+            conn.close()
+        return float(r["weight"]) if r else 1.0
+
+    @classmethod
+    def set_rule_weight(cls, disease_id: str, weight: float):
+        """Upsert the Rule_Weight for *disease_id*.
+
+        Args:
+            disease_id (str): Unique disease identifier.
+            weight (float): New weight value, expected to be clamped to [0.5, 2.0]
+                by the caller before this method is invoked.
+        """
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        with _db_lock:
+            conn = cls.get_conn()
+            conn.execute(
+                """
+                INSERT INTO rule_weights(disease_id, weight, last_updated)
+                VALUES(?, ?, ?)
+                ON CONFLICT(disease_id) DO UPDATE SET
+                    weight = excluded.weight,
+                    last_updated = excluded.last_updated
+                """,
+                (disease_id, weight, now),
+            )
+            conn.commit()
+            conn.close()
+
+    @classmethod
+    def log_weight_history(cls, disease_id: str, old_weight: float, new_weight: float):
+        """Append an audit row to rule_weight_history.
+
+        Args:
+            disease_id (str): Unique disease identifier.
+            old_weight (float): Previous weight before the update.
+            new_weight (float): Updated weight after recomputation.
+        """
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        with _db_lock:
+            conn = cls.get_conn()
+            conn.execute(
+                """
+                INSERT INTO rule_weight_history(disease_id, old_weight, new_weight, logged_at)
+                VALUES(?, ?, ?, ?)
+                """,
+                (disease_id, old_weight, new_weight, now),
+            )
+            conn.commit()
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Feedback / report aggregate helpers (Requirements 2 & 3)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def get_feedback_counts(cls, disease_id: str) -> dict:
+        """Return aggregated feedback counts for *disease_id*.
+
+        Args:
+            disease_id (str): Unique disease identifier.
+
+        Returns:
+            dict: Keys total (int), success (int), partial (int), failed (int).
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            r = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN feedback_status='SUCCESS' THEN 1 ELSE 0 END) AS success,
+                    SUM(CASE WHEN feedback_status='PARTIAL' THEN 1 ELSE 0 END) AS partial,
+                    SUM(CASE WHEN feedback_status='FAILED'  THEN 1 ELSE 0 END) AS failed
+                FROM feedback_learning
+                WHERE disease_id = ?
+                """,
+                (disease_id,),
+            ).fetchone()
+            conn.close()
+        return {
+            "total": r["total"] or 0,
+            "success": r["success"] or 0,
+            "partial": r["partial"] or 0,
+            "failed": r["failed"] or 0,
+        }
+
+    @classmethod
+    def count_feedback_for_disease(cls, disease_id: str) -> int:
+        """Return the total number of Feedback_Records for *disease_id*.
+
+        Args:
+            disease_id (str): Unique disease identifier.
+
+        Returns:
+            int: Count of feedback rows matching disease_id.
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            n = conn.execute(
+                "SELECT COUNT(*) FROM feedback_learning WHERE disease_id=?",
+                (disease_id,),
+            ).fetchone()[0]
+            conn.close()
+        return n
+
+    @classmethod
+    def count_severe_reports(cls, district: str, cutoff_iso: str) -> int:
+        """COUNT reports with HIGH or CRITICAL severity for *district* since *cutoff_iso*.
+
+        Args:
+            district (str): District name to filter by.
+            cutoff_iso (str): ISO 8601 UTC timestamp lower bound (inclusive).
+
+        Returns:
+            int: Number of matching report rows.
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            n = conn.execute(
+                """
+                SELECT COUNT(*) FROM reports
+                WHERE district=? AND severity IN ('HIGH','CRITICAL') AND created_at >= ?
+                """,
+                (district, cutoff_iso),
+            ).fetchone()[0]
+            conn.close()
+        return n
+
+    @classmethod
+    def count_etl_exceeded(cls, district: str, cutoff_iso: str) -> int:
+        """COUNT trap_log rows where is_exceeded=1 for *district* since *cutoff_iso*.
+
+        Args:
+            district (str): District name to filter by.
+            cutoff_iso (str): ISO 8601 UTC timestamp lower bound (inclusive).
+
+        Returns:
+            int: Number of trap log entries above ETL threshold.
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            n = conn.execute(
+                """
+                SELECT COUNT(*) FROM trap_logs
+                WHERE district=? AND is_exceeded=1 AND logged_at >= ?
+                """,
+                (district, cutoff_iso),
+            ).fetchone()[0]
+            conn.close()
+        return n
+
+    @classmethod
+    def sum_moth_count(cls, district: str, cutoff_iso: str) -> int:
+        """SUM moth_count from trap_logs for *district* since *cutoff_iso*.
+
+        Args:
+            district (str): District name to filter by.
+            cutoff_iso (str): ISO 8601 UTC timestamp lower bound (inclusive).
+
+        Returns:
+            int: Total moth count; 0 if no matching rows.
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            r = conn.execute(
+                "SELECT SUM(moth_count) FROM trap_logs WHERE district=? AND logged_at >= ?",
+                (district, cutoff_iso),
+            ).fetchone()[0]
+            conn.close()
+        return int(r) if r else 0
+
+    @classmethod
+    def count_reports_this_week(cls, district: str, cutoff_iso: str) -> int:
+        """COUNT reports submitted for *district* since *cutoff_iso*.
+
+        Args:
+            district (str): District name to filter by.
+            cutoff_iso (str): ISO 8601 UTC timestamp lower bound (inclusive).
+
+        Returns:
+            int: Number of report rows for the district within the window.
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            n = conn.execute(
+                "SELECT COUNT(*) FROM reports WHERE district=? AND created_at >= ?",
+                (district, cutoff_iso),
+            ).fetchone()[0]
+            conn.close()
+        return n
+
+    # ------------------------------------------------------------------
+    # Retrain task management (Requirement 2.8–2.10)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def create_retrain_task(cls, task_id: str, started_at: str):
+        """Insert a new retrain task row with status 'running'.
+
+        Args:
+            task_id (str): Unique UUID string for the task.
+            started_at (str): ISO 8601 UTC timestamp when the task was launched.
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            conn.execute(
+                """
+                INSERT INTO retrain_tasks(task_id, status, started_at)
+                VALUES(?, 'running', ?)
+                """,
+                (task_id, started_at),
+            )
+            conn.commit()
+            conn.close()
+
+    @classmethod
+    def update_retrain_task(
+        cls,
+        task_id: str,
+        status: str,
+        completed_at: Optional[str] = None,
+        final_accuracy: Optional[float] = None,
+        error_message: Optional[str] = None,
+    ):
+        """Update an existing retrain task with its outcome.
+
+        Args:
+            task_id (str): Unique task identifier to update.
+            status (str): New status — 'running', 'completed', or 'failed'.
+            completed_at (Optional[str]): ISO 8601 timestamp of completion.
+            final_accuracy (Optional[float]): Test-set accuracy in [0.0, 1.0].
+            error_message (Optional[str]): Description of failure if status='failed'.
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            conn.execute(
+                """
+                UPDATE retrain_tasks SET
+                    status = ?,
+                    completed_at = COALESCE(?, completed_at),
+                    final_accuracy = COALESCE(?, final_accuracy),
+                    error_message = COALESCE(?, error_message)
+                WHERE task_id = ?
+                """,
+                (status, completed_at, final_accuracy, error_message, task_id),
+            )
+            conn.commit()
+            conn.close()
+
+    @classmethod
+    def get_retrain_task(cls, task_id: str) -> Optional[dict]:
+        """Fetch a retrain task row by *task_id*.
+
+        Args:
+            task_id (str): Unique task identifier.
+
+        Returns:
+            Optional[dict]: Row as a dict, or None if the task does not exist.
+        """
+        with _db_lock:
+            conn = cls.get_conn()
+            r = conn.execute(
+                "SELECT * FROM retrain_tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            conn.close()
+        return dict(r) if r else None
+
+
+# ============================================================================
+# 3. AUTH SERVICE — PBKDF2 + JWT + Account Lockout (Tasks 3.1, 3.3, 3.4, 3.6)
+# ============================================================================
+
+class AuthError(Exception):
+    def __init__(self, message: str, status_code: int = 401):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class AuthService:
+    """Handles user registration, login, JWT issuance, and PIN management.
+
+    Security properties:
+    - PINs hashed with PBKDF2-HMAC-SHA256 (260,000 iterations, per-user salt)
+    - JWTs signed with HMAC-SHA256, 8-hour expiry, token_version for invalidation
+    - Timing-safe PIN comparison via hmac.compare_digest
+    - Account lockout after 5 failed attempts within 10 minutes
+    """
+
+    PBKDF2_ITERATIONS = 260_000
+    PBKDF2_HASH = "sha256"
+    JWT_EXPIRY_HOURS = 8
+    MAX_FAILED_ATTEMPTS = 5
+    LOCKOUT_WINDOW_MINUTES = 10
+    LOCKOUT_DURATION_MINUTES = 30
+
+    @staticmethod
+    def _validate_pin(pin: str) -> None:
+        if not (6 <= len(pin) <= 12) or not pin.isdigit():
+            raise ValueError("PIN must be 6-12 digits (0-9 only)")
+
+    @staticmethod
+    def hash_pin(pin: str, salt: bytes) -> str:
+        dk = hashlib.pbkdf2_hmac(
+            AuthService.PBKDF2_HASH,
+            pin.encode("utf-8"),
+            salt,
+            AuthService.PBKDF2_ITERATIONS
+        )
+        return dk.hex()
+
+    @staticmethod
+    def verify_pin(stored_hash: str, salt_hex: str, candidate_pin: str) -> bool:
+        try:
+            salt = bytes.fromhex(salt_hex)
+        except ValueError:
+            return False
+        candidate = AuthService.hash_pin(candidate_pin, salt)
+        return hmac.compare_digest(candidate, stored_hash)
+
+    @staticmethod
+    def issue_jwt(user_id: str, role: str, token_version: int) -> str:
+        now = datetime.datetime.utcnow()
+        payload = {
+            "user_id": user_id,
+            "role": role,
+            "token_version": token_version,
+            "iat": int(now.timestamp()),
+            "exp": int((now + datetime.timedelta(hours=AuthService.JWT_EXPIRY_HOURS)).timestamp())
+        }
+        header_b64 = base64.urlsafe_b64encode(
+            json.dumps({"alg": "HS256", "typ": "JWT"}).encode()
+        ).rstrip(b"=").decode()
+        body_b64 = base64.urlsafe_b64encode(
+            json.dumps(payload).encode()
+        ).rstrip(b"=").decode()
+        sig_input = f"{header_b64}.{body_b64}".encode()
+        sig = hmac.new(_JWT_SECRET.encode(), sig_input, "sha256").digest()
+        sig_b64 = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+        return f"{header_b64}.{body_b64}.{sig_b64}"
+
+    @staticmethod
+    def validate_jwt(token: str) -> dict:
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise ValueError("Malformed token")
+        header_b64, body_b64, sig_b64 = parts
+        sig_input = f"{header_b64}.{body_b64}".encode()
+        expected_sig = hmac.new(_JWT_SECRET.encode(), sig_input, "sha256").digest()
+        expected_b64 = base64.urlsafe_b64encode(expected_sig).rstrip(b"=").decode()
+        if not hmac.compare_digest(sig_b64, expected_b64):
+            raise ValueError("Invalid signature")
+        # Pad base64 for decoding
+        body_padded = body_b64 + "=="
+        payload = json.loads(base64.urlsafe_b64decode(body_padded))
+        if payload.get("exp", 0) < int(datetime.datetime.utcnow().timestamp()):
+            raise ValueError("Token expired")
+        return payload
+
+    @classmethod
+    def register(cls, name: str, phone: str, pin: str, role: UserRole, district: str) -> "UserRecord":
+        cls._validate_pin(pin)
         existing = Database.get_user_by_phone(phone)
         if existing:
             raise ValueError("Phone number already registered")
+        salt = os.urandom(16)
         user = UserRecord(
             user_id=f"USR-{secrets.token_hex(6).upper()}",
             name=name, phone=phone, role=role, district=district,
-            pin_hash=cls.hash_pin(pin),
-            created_at=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            pin_hash=cls.hash_pin(pin, salt),
+            pin_salt=salt.hex(),
+            token_version=0,
+            created_at=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         )
         Database.save_user(user)
         return user
 
     @classmethod
-    def login(cls, phone: str, pin: str) -> Optional[str]:
+    def login(cls, phone: str, pin: str) -> str:
         user = Database.get_user_by_phone(phone)
         if not user:
-            return None
-        if user.pin_hash != cls.hash_pin(pin):
-            return None
-        token = secrets.token_hex(32)
-        Database.update_user_token(phone, token)
-        return token
+            raise AuthError("Authentication failed", 401)
+        # Check lockout
+        if user.locked_until:
+            try:
+                locked_dt = datetime.datetime.fromisoformat(user.locked_until)
+                if datetime.datetime.utcnow() < locked_dt:
+                    raise AuthError("Account locked. Try after 30 minutes.", 429)
+                else:
+                    # Lockout expired — reset
+                    Database.reset_failed_attempts(phone)
+                    user.failed_attempts = 0
+                    user.locked_until = None
+            except (ValueError, AttributeError):
+                pass
+        if not cls.verify_pin(user.pin_hash, user.pin_salt, pin):
+            new_attempts = user.failed_attempts + 1
+            locked_until = None
+            if new_attempts >= cls.MAX_FAILED_ATTEMPTS:
+                locked_until = (
+                    datetime.datetime.utcnow() +
+                    datetime.timedelta(minutes=cls.LOCKOUT_DURATION_MINUTES)
+                ).isoformat()
+            Database.record_failed_attempt(phone, new_attempts, locked_until)
+            raise AuthError("Authentication failed", 401)
+        Database.reset_failed_attempts(phone)
+        return cls.issue_jwt(user.user_id, user.role.value, user.token_version)
 
     @classmethod
-    def get_session_user(cls, token: str) -> Optional[UserRecord]:
+    def change_pin(cls, user_id: str, new_pin: str, auth_credential: str) -> bool:
+        """Change PIN: validates new PIN, generates fresh salt, increments token_version."""
+        cls._validate_pin(new_pin)
+        user = Database.get_user_by_phone_or_id(user_id)
+        if not user:
+            raise AuthError("User not found", 401)
+        # Validate current credential (either current PIN or a valid JWT)
+        credential_ok = False
+        try:
+            payload = cls.validate_jwt(auth_credential)
+            if payload.get("user_id") == user.user_id and payload.get("token_version") == user.token_version:
+                credential_ok = True
+        except ValueError:
+            # Try as PIN
+            credential_ok = cls.verify_pin(user.pin_hash, user.pin_salt, auth_credential)
+        if not credential_ok:
+            raise AuthError("Invalid credential", 401)
+        salt = os.urandom(16)
+        new_hash = cls.hash_pin(new_pin, salt)
+        with _db_lock:
+            conn = Database.get_conn()
+            conn.execute(
+                "UPDATE users SET pin_hash=?, pin_salt=?, token_version=token_version+1, "
+                "failed_attempts=0, locked_until=NULL WHERE user_id=?",
+                (new_hash, salt.hex(), user.user_id)
+            )
+            conn.commit()
+            conn.close()
+        return True
+
+    @classmethod
+    def get_session_user(cls, token: str) -> Optional["UserRecord"]:
         if not token:
             return None
-        return Database.get_user_by_token(token)
+        try:
+            payload = cls.validate_jwt(token)
+        except ValueError:
+            return None
+        user = Database.get_user_by_phone_or_id(payload.get("user_id", ""))
+        if not user:
+            return None
+        if payload.get("token_version", -1) != user.token_version:
+            return None
+        return user
 
     @classmethod
     def seed_demo_users(cls):
-        """Create demo accounts if none exist"""
         demos = [
-            ("Rajesh Patil", "9876543210", "1234", UserRole.FARMER, "Yavatmal"),
-            ("Dr. Suresh Kulkarni", "9876543211", "5678", UserRole.EXTENSION_OFFICER, "Nagpur"),
-            ("Collector Sharma", "9876543212", "9999", UserRole.OFFICIAL, "Mumbai"),
+            ("Rajesh Patil", "9876543210", "123456", UserRole.FARMER, "Yavatmal"),
+            ("Dr. Suresh Kulkarni", "9876543211", "567890", UserRole.EXTENSION_OFFICER, "Nagpur"),
+            ("Collector Sharma", "9876543212", "999999", UserRole.OFFICIAL, "Mumbai"),
         ]
         for name, phone, pin, role, district in demos:
             try:
                 cls.register(name, phone, pin, role, district)
             except ValueError:
-                pass  # already seeded
+                pass
 
 
 # ============================================================================
@@ -1371,77 +1994,244 @@ IPMDecisionTree._build()
 
 
 # ============================================================================
-# 8. REAL MAHARASHTRA DISTRICT GIS DATA (FIX 5: 36 districts, real coords)
+# 7b. LEARNING ENGINE — Rule_Weight Feedback Loop (Tasks 5.1–5.6)
 # ============================================================================
 
-class MaharashtraGISData:
-    """Real 36 Maharashtra districts with actual coordinates and crop profiles"""
+class LearningEngine:
+    """Computes and persists Rule_Weight adjustments from feedback records.
 
-    ALL_DISTRICTS: List[MaharashtraDistrictRecord] = [
-        MaharashtraDistrictRecord("Yavatmal","Amravati",20.3888,78.1204,["Cotton","Soybean","Tur"],"Black Cotton Soil","Flowering","Pink Bollworm",ThreatSeverity.CRITICAL,14,0.42,True,"ETL exceeded - Pink Bollworm outbreak in Yavatmal. Immediate pheromone trap deployment required.",12),
-        MaharashtraDistrictRecord("Amravati","Amravati",20.9320,77.7523,["Cotton","Soybean","Orange"],"Medium Black Soil","Boll Development","Bollworm (Helicoverpa)",ThreatSeverity.HIGH,9,0.48,True,"High Helicoverpa pressure. Install H.armigera NPV traps. Scout 100 plants per field.",8),
-        MaharashtraDistrictRecord("Akola","Amravati",20.7090,77.0082,["Cotton","Soybean","Chickpea"],"Black Cotton Soil","Vegetative","Whitefly",ThreatSeverity.HIGH,8,0.51,True,"Elevated whitefly. CLCuV risk moderate. Install yellow sticky traps immediately.",7),
-        MaharashtraDistrictRecord("Buldhana","Amravati",20.5292,76.1842,["Cotton","Soybean","Tur"],"Black Cotton Soil","Vegetative","Whitefly & CLCuV",ThreatSeverity.MODERATE,5,0.55,False,"Moderate whitefly activity. Preventive neem spray recommended.",4),
-        MaharashtraDistrictRecord("Washim","Amravati",20.1100,77.1300,["Cotton","Soybean"],"Black Cotton Soil","Flowering","Pink Bollworm",ThreatSeverity.HIGH,10,0.44,True,"Pink bollworm trap catches rising. Apply Chlorantraniliprole before ETL breach.",9),
-        MaharashtraDistrictRecord("Nagpur","Nagpur",21.1458,79.0882,["Orange","Cotton","Wheat"],"Red Sandy Loam","Fruiting","Thrips",ThreatSeverity.MODERATE,6,0.53,False,"Orange thrips moderate. Monitor 30 leaves/tree. Blue sticky traps recommended.",5),
-        MaharashtraDistrictRecord("Wardha","Nagpur",20.7453,78.6022,["Cotton","Soybean"],"Black Cotton Soil","Boll Development","Pink Bollworm",ThreatSeverity.CRITICAL,15,0.40,True,"CRITICAL: ETL exceeded in Wardha cotton. Immediate chemical intervention required.",14),
-        MaharashtraDistrictRecord("Chandrapur","Nagpur",19.9615,79.2961,["Rice","Cotton","Teak"],"Laterite","Vegetative","Rice Blast",ThreatSeverity.HIGH,0,0.46,True,"High blast risk due to RH >80%. Apply Tricyclazole preventively.",6),
-        MaharashtraDistrictRecord("Bhandara","Nagpur",21.1666,79.6500,["Rice"],"Alluvial","Tillering","Sheath Blight",ThreatSeverity.HIGH,0,0.49,True,"Sheath blight spreading in Bhandara paddy. Drain excess water.",5),
-        MaharashtraDistrictRecord("Gondia","Nagpur",21.4608,80.1917,["Rice","Wheat"],"Medium Black","Transplanting","Brown Plant Hopper",ThreatSeverity.MODERATE,0,0.52,False,"BPH population building. Monitor 10 hills/point. Buprofezin ready.",3),
-        MaharashtraDistrictRecord("Aurangabad","Marathwada",19.8762,75.3433,["Grapes","Sugarcane","Cotton","Soybean"],"Medium Black Soil","Fruiting","Grape Downy Mildew",ThreatSeverity.HIGH,0,0.50,True,"Grape downy mildew risk high in Aurangabad vineyards. Metalaxyl spray needed.",7),
-        MaharashtraDistrictRecord("Jalna","Marathwada",19.8347,75.8816,["Cotton","Soybean","Tur"],"Deep Black Soil","Vegetative","Soybean Yellow Mosaic",ThreatSeverity.HIGH,0,0.47,True,"YMV incidence >5% in Jalna soybean. Remove infected plants. Control whitefly.",8),
-        MaharashtraDistrictRecord("Beed","Marathwada",18.9891,75.7601,["Sugarcane","Cotton","Soybean"],"Medium Black","Vegetative","Sugarcane Smut",ThreatSeverity.MODERATE,0,0.53,False,"Smut scouting recommended in ratoon sugarcane fields.",4),
-        MaharashtraDistrictRecord("Latur","Marathwada",18.4088,76.5604,["Soybean","Tur","Chickpea"],"Deep Black Soil","Flowering","Pigeonpea Wilt",ThreatSeverity.HIGH,0,0.44,True,"Fusarium wilt spreading in Latur tur fields. Remove wilted plants. Soil solarize next season.",9),
-        MaharashtraDistrictRecord("Osmanabad","Marathwada",18.1860,76.0359,["Soybean","Tur","Sunflower"],"Medium Black","Podding","Soybean Rust",ThreatSeverity.MODERATE,0,0.50,False,"Monitor lower leaves for soybean rust pustules. Prophylactic tebuconazole spray advised.",3),
-        MaharashtraDistrictRecord("Nanded","Marathwada",19.1383,77.3210,["Cotton","Soybean","Tur"],"Deep Black Soil","Flowering","Pink Bollworm",ThreatSeverity.HIGH,11,0.43,True,"Pink bollworm approaching ETL in Nanded. Set gossyplure traps.",10),
-        MaharashtraDistrictRecord("Hingoli","Marathwada",19.7160,77.1490,["Soybean","Cotton","Tur"],"Black Cotton Soil","Vegetative","Fall Armyworm",ThreatSeverity.MODERATE,0,0.54,False,"FAW pressure building in maize blocks. Scout whorls daily.",3),
-        MaharashtraDistrictRecord("Parbhani","Marathwada",19.2704,76.7747,["Cotton","Soybean","Tur"],"Deep Black Soil","Boll Development","Whitefly & CLCuV",ThreatSeverity.HIGH,7,0.46,True,"Whitefly ETL breach in Parbhani cotton. Spiromesifen spray immediate.",7),
-        MaharashtraDistrictRecord("Nashik","Nashik",20.0059,73.7898,["Grapes","Onion","Tomato","Wheat"],"Sandy Loam","Fruiting","Grape Downy Mildew",ThreatSeverity.CRITICAL,0,0.39,True,"CRITICAL: Downy mildew in Nashik vineyards. Metalaxyl + Mancozeb mandatory before rain.",15),
-        MaharashtraDistrictRecord("Ahmednagar","Nashik",19.0952,74.7389,["Sugarcane","Onion","Wheat"],"Medium Black","Vegetative","Onion Purple Blotch",ThreatSeverity.HIGH,0,0.48,True,"Purple blotch spreading in Ahmednagar onion. Iprodione spray needed.",8),
-        MaharashtraDistrictRecord("Dhule","Nashik",20.9020,74.7748,["Cotton","Maize","Soybean"],"Medium Loam","Vegetative","Fall Armyworm",ThreatSeverity.HIGH,0,0.47,True,"FAW outbreak in Dhule maize. Chlorantraniliprole whorl treatment required.",9),
-        MaharashtraDistrictRecord("Nandurbar","Nashik",21.3700,74.2400,["Rice","Maize","Tur"],"Laterite","Tillering","Stem Borer",ThreatSeverity.MODERATE,0,0.52,False,"Stem borer monitoring needed. Install Trichogramma @ 50,000/acre.",3),
-        MaharashtraDistrictRecord("Jalgaon","Nashik",21.0077,75.5626,["Cotton","Banana","Onion"],"Alluvial Loam","Boll Development","Whitefly",ThreatSeverity.CRITICAL,22,0.39,True,"SEVERE: Whitefly ETL critically exceeded in Jalgaon. Immediate Spiromesifen intervention.",18),
-        MaharashtraDistrictRecord("Pune","Pune",18.5204,73.8567,["Grapes","Onion","Tomato","Sugarcane"],"Laterite/Clay","Fruiting","Powdery Mildew",ThreatSeverity.MODERATE,0,0.55,False,"Powdery mildew moderate on grapes. Sulphur spray advisory issued.",4),
-        MaharashtraDistrictRecord("Satara","Pune",17.6805,74.0183,["Sugarcane","Tomato","Pomegranate"],"Red Sandy Loam","Vegetative","Bacterial Blight",ThreatSeverity.MODERATE,0,0.56,False,"Bacterial blight in pomegranate orchards. Copper-based spray recommended.",3),
-        MaharashtraDistrictRecord("Solapur","Pune",17.6599,75.9064,["Sorghum","Cotton","Pomegranate"],"Black Cotton Soil","Vegetative","Stem Borer",ThreatSeverity.MODERATE,0,0.54,False,"Sorghum stem borer scouting. Pheromone traps deployed.",4),
-        MaharashtraDistrictRecord("Kolhapur","Pune",16.7050,74.2433,["Sugarcane","Rice","Banana"],"Red Laterite","Vegetative","Sugarcane Pyrilla",ThreatSeverity.LOW,0,0.60,False,"Low pyrilla activity. Epipyrops parasitoid maintaining natural control.",2),
-        MaharashtraDistrictRecord("Sangli","Pune",16.8524,74.5815,["Grapes","Sugarcane","Turmeric"],"Sandy Loam","Fruiting","Grape Downy Mildew",ThreatSeverity.HIGH,0,0.43,True,"Downy mildew risk elevated in Sangli vineyards during monsoon.",7),
-        MaharashtraDistrictRecord("Mumbai Suburban","Konkan",19.0760,72.8777,["Vegetables","Rice"],"Coastal Sandy","Vegetative","Aphids",ThreatSeverity.LOW,0,0.62,False,"Urban vegetable gardens - low aphid pressure. Neem spray preventive.",1),
-        MaharashtraDistrictRecord("Thane","Konkan",19.2183,72.9781,["Rice","Vegetables"],"Laterite","Tillering","Sheath Blight",ThreatSeverity.MODERATE,0,0.51,False,"Sheath blight risk moderate in Thane paddy. Monitor from tillering.",3),
-        MaharashtraDistrictRecord("Raigad","Konkan",18.5158,73.1298,["Rice","Mango","Cashew"],"Laterite","Ripening","Rice Blast",ThreatSeverity.MODERATE,0,0.50,False,"Rice blast risk. Use Tricyclazole 75 WP as precaution.",3),
-        MaharashtraDistrictRecord("Ratnagiri","Konkan",16.9902,73.3120,["Mango","Cashew","Rice"],"Laterite","Fruiting","Powdery Mildew",ThreatSeverity.LOW,0,0.58,False,"Low disease pressure in Ratnagiri mango orchards. Sulphur spray preventive.",1),
-        MaharashtraDistrictRecord("Sindhudurg","Konkan",16.3500,73.8200,["Coconut","Cashew","Rice"],"Coastal Laterite","Vegetative","Aphids",ThreatSeverity.LOW,0,0.63,False,"Minimal pest activity. Favorable monsoon conditions.",1),
-        MaharashtraDistrictRecord("Palghar","Konkan",19.6967,72.7697,["Rice","Maize","Vegetables"],"Sandy Loam","Vegetative","Fall Armyworm",ThreatSeverity.MODERATE,0,0.52,False,"FAW monitoring in Palghar maize blocks.",2),
-        MaharashtraDistrictRecord("Gadchiroli","Nagpur",20.1809,79.9444,["Rice","Teak","Bamboo"],"Red Laterite","Vegetative","Rice Blast",ThreatSeverity.MODERATE,0,0.51,False,"Rice blast risk in tribal rice cultivation. Resistant varieties recommended.",3),
-        MaharashtraDistrictRecord("Hingoli","Marathwada",19.7160,77.1490,["Soybean","Cotton","Tur"],"Black Cotton Soil","Vegetative","Soybean Yellow Mosaic",ThreatSeverity.HIGH,0,0.46,True,"YMV spreading in Hingoli. Rogue infected plants; control whitefly.",6),
-    ]
+    Rule_Weight formula:
+        weight = clamp((success + 0.5 * partial) / total, 0.5, 2.0)
+
+    Weights are recomputed every 20 feedback records per disease.
+    Each recomputation is logged to rule_weight_history for audit.
+    """
+
+    RECOMPUTE_THRESHOLD: int = 20
+    WEIGHT_MIN: float = 0.5
+    WEIGHT_MAX: float = 2.0
 
     @classmethod
-    def get_all(cls) -> List[MaharashtraDistrictRecord]:
-        # Update reports count from DB
-        result = []
-        for d in cls.ALL_DISTRICTS:
-            # Avoid duplicate district names
-            if not any(r.district_name == d.district_name for r in result):
-                result.append(d)
-        return result
+    def compute_weight(cls, disease_id: str) -> float:
+        """Compute Rule_Weight from raw feedback counts for *disease_id*.
+
+        Formula: clamp((success + 0.5 * partial) / total, 0.5, 2.0)
+
+        Args:
+            disease_id: Unique disease identifier.
+
+        Returns:
+            float: Weight clamped to [0.5, 2.0].  Returns 1.0 if no feedback.
+        """
+        counts = Database.get_feedback_counts(disease_id)
+        total = counts["total"]
+        if total == 0:
+            return 1.0
+        success = counts["success"]
+        partial = counts["partial"]
+        raw = (success + 0.5 * partial) / total
+        return max(cls.WEIGHT_MIN, min(cls.WEIGHT_MAX, raw))
+
+    @classmethod
+    def get_weight(cls, disease_id: str) -> float:
+        """Return stored Rule_Weight for *disease_id*, defaulting to 1.0.
+
+        Args:
+            disease_id: Unique disease identifier.
+
+        Returns:
+            float: Stored weight, or 1.0 if no record exists.
+        """
+        return Database.get_rule_weight(disease_id)
+
+    @classmethod
+    def on_feedback_submitted(cls, disease_id: str) -> None:
+        """Recompute and persist weight when count reaches a multiple of 20.
+
+        Called after a new feedback_learning row has been persisted for
+        *disease_id*.  Reads the total count; if it is a non-zero multiple
+        of RECOMPUTE_THRESHOLD the weight is recomputed, written to
+        rule_weights, and the delta appended to rule_weight_history.
+
+        Args:
+            disease_id: Unique disease identifier just updated.
+        """
+        total = Database.count_feedback_for_disease(disease_id)
+        if total > 0 and total % cls.RECOMPUTE_THRESHOLD == 0:
+            old_weight = Database.get_rule_weight(disease_id)
+            new_weight = cls.compute_weight(disease_id)
+            Database.set_rule_weight(disease_id, new_weight)
+            Database.log_weight_history(disease_id, old_weight, new_weight)
+
+
+# ============================================================================
+# 8. HOTSPOT ENGINE — Live GIS from DB + NASA GIBS NDVI (Tasks 4.1, 4.2)
+# ============================================================================
+
+class HotspotEngine:
+    """
+    Computes live district outbreak risk from real DB queries + NASA GIBS NDVI.
+    Zero hardcoded risk levels, NDVI values, or trap counts.
+    """
+    REPORT_LOOKBACK_DAYS = 14
+    TRAP_LOOKBACK_DAYS = 7
+    NDVI_CACHE_TTL_HOURS = 24
+    NDVI_API_TIMEOUT_SECONDS = 10
+    REPORT_NORMALIZATION_CAP = 20
+    TRAP_NORMALIZATION_CAP = 50
+
+    DISTRICT_CENTROIDS: Dict[str, Tuple[float, float]] = {
+        "Nashik": (20.0059, 73.7897), "Pune": (18.5204, 73.8567),
+        "Nagpur": (21.1458, 79.0882), "Aurangabad": (19.8762, 75.3433),
+        "Solapur": (17.6805, 75.9064), "Kolhapur": (16.7050, 74.2433),
+        "Amravati": (20.9374, 77.7796), "Yavatmal": (20.3888, 78.1204),
+        "Nanded": (19.1383, 77.3210), "Latur": (18.4088, 76.5604),
+        "Osmanabad": (18.1860, 76.0390), "Jalna": (19.8347, 75.8816),
+        "Beed": (18.9890, 75.7601), "Buldhana": (20.5292, 76.1842),
+        "Akola": (20.7096, 77.0023), "Washim": (20.1111, 77.1449),
+        "Hingoli": (19.7175, 77.1498), "Parbhani": (19.2704, 76.7747),
+        "Wardha": (20.7453, 78.6022), "Chandrapur": (19.9615, 79.2961),
+        "Gadchiroli": (20.1809, 80.0000), "Gondia": (21.4600, 80.1900),
+        "Bhandara": (21.1700, 79.6500), "Raigad": (18.5158, 73.1298),
+        "Ratnagiri": (16.9944, 73.3000), "Sindhudurg": (16.3497, 73.7139),
+        "Thane": (19.2183, 72.9781), "Mumbai": (19.0760, 72.8777),
+        "Palghar": (19.6967, 72.7697), "Dhule": (20.9042, 74.7749),
+        "Nandurbar": (21.3667, 74.2444), "Jalgaon": (21.0077, 75.5626),
+        "Ahmednagar": (19.0952, 74.7480), "Satara": (17.6805, 74.0183),
+        "Sangli": (16.8524, 74.5815),
+    }
+
+    @classmethod
+    def fetch_ndvi(cls, district: str, lat: float, lon: float) -> Tuple[float, str]:
+        """Fetch NDVI from NASA GIBS WMS (MODIS Terra NDVI 8-Day) with 24h cache."""
+        cached = Database.get_ndvi_cache(district)
+        if cached:
+            try:
+                fetched_str = cached["fetched_at"].rstrip("Z")
+                age_h = (datetime.datetime.utcnow() -
+                         datetime.datetime.fromisoformat(fetched_str)
+                         ).total_seconds() / 3600
+                if age_h < cls.NDVI_CACHE_TTL_HOURS:
+                    return cached["ndvi_value"], "cache"
+            except (ValueError, TypeError):
+                pass
+        # Request 32x32 PNG from NASA GIBS
+        delta = 0.5
+        bbox = f"{lon-delta},{lat-delta},{lon+delta},{lat+delta}"
+        params = {
+            "SERVICE": "WMS", "VERSION": "1.3.0", "REQUEST": "GetMap",
+            "LAYERS": "MODIS_Terra_NDVI_8Day", "CRS": "EPSG:4326",
+            "BBOX": bbox, "WIDTH": "32", "HEIGHT": "32",
+            "FORMAT": "image/png", "TRANSPARENT": "true",
+            "TIME": datetime.date.today().strftime("%Y-%m-%d")
+        }
+        url = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?" + \
+              urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "AgriShield/2.0"})
+            with urllib.request.urlopen(req, timeout=cls.NDVI_API_TIMEOUT_SECONDS) as resp:
+                png_bytes = resp.read()
+            ndvi_value = cls._png_to_ndvi(png_bytes)
+            Database.update_ndvi_cache(district, ndvi_value, "live")
+            return ndvi_value, "live"
+        except Exception:
+            if cached:
+                return cached["ndvi_value"], "cache"
+            Database.update_ndvi_cache(district, 0.5, "default")
+            return 0.5, "default"
+
+    @staticmethod
+    def _png_to_ndvi(png_bytes: bytes) -> float:
+        """Extract NDVI proxy from MODIS NDVI PNG via green channel average."""
+        import struct, zlib
+        try:
+            data = io.BytesIO(png_bytes)
+            data.read(8)  # PNG signature
+            green_values = []
+            while True:
+                length_bytes = data.read(4)
+                if len(length_bytes) < 4:
+                    break
+                length = struct.unpack(">I", length_bytes)[0]
+                chunk_type = data.read(4).decode("ascii", errors="ignore")
+                chunk_data = data.read(length)
+                data.read(4)  # CRC
+                if chunk_type == "IDAT":
+                    try:
+                        raw = zlib.decompress(chunk_data)
+                        for i in range(1, len(raw), 4):
+                            green_values.append(raw[i])
+                    except Exception:
+                        pass
+                if chunk_type == "IEND":
+                    break
+            if green_values:
+                return round(sum(green_values) / (len(green_values) * 255.0), 4)
+            return 0.5
+        except Exception:
+            return 0.5
+
+    @classmethod
+    def compute_district_score(cls, district: str) -> dict:
+        """Compute live outbreak score for one district. All data from real sources."""
+        lat, lon = cls.DISTRICT_CENTROIDS.get(district, (19.0, 75.0))
+        now_utc = datetime.datetime.utcnow()
+        cutoff_14d = (now_utc - datetime.timedelta(days=14)).isoformat()
+        cutoff_7d = (now_utc - datetime.timedelta(days=7)).isoformat()
+        # Component A: severe reports (weight 0.5)
+        severe_reports = Database.count_severe_reports(district, cutoff_14d)
+        score_a = min(severe_reports / cls.REPORT_NORMALIZATION_CAP, 1.0)
+        # Component B: ETL-exceeded traps (weight 0.3)
+        etl_exceeded = Database.count_etl_exceeded(district, cutoff_7d)
+        trap_count = Database.sum_moth_count(district, cutoff_7d)
+        score_b = min(etl_exceeded / cls.TRAP_NORMALIZATION_CAP, 1.0)
+        # Component C: NDVI (weight 0.2) — low NDVI = stressed = higher risk
+        ndvi_value, ndvi_source = cls.fetch_ndvi(district, lat, lon)
+        score_c = 1.0 - ndvi_value
+        weighted_score = round(0.5 * score_a + 0.3 * score_b + 0.2 * score_c, 4)
+        if weighted_score > 0.75:
+            risk = "CRITICAL"
+        elif weighted_score > 0.50:
+            risk = "HIGH"
+        elif weighted_score > 0.25:
+            risk = "MODERATE"
+        else:
+            risk = "LOW"
+        reports_this_week = Database.count_reports_this_week(district, cutoff_7d)
+        return {
+            "district_name": district, "outbreak_risk": risk,
+            "weighted_score": weighted_score, "trap_count": trap_count,
+            "reports_this_week": reports_this_week,
+            "ndvi_value": ndvi_value, "ndvi_source": ndvi_source,
+            "latitude": lat, "longitude": lon,
+            "last_computed": now_utc.isoformat()
+        }
+
+    @classmethod
+    def get_all_hotspots(cls) -> list:
+        """Returns live hotspot records for all 35 Maharashtra districts."""
+        return [cls.compute_district_score(d) for d in cls.DISTRICT_CENTROIDS]
+
+
+# Backward-compat alias: existing code referencing MaharashtraGISData still works.
+class MaharashtraGISData:
+    @classmethod
+    def get_all(cls):
+        return HotspotEngine.get_all_hotspots()
 
     @classmethod
     def get_district_stats(cls) -> Dict[str, Any]:
-        districts = cls.get_all()
-        critical = sum(1 for d in districts if d.outbreak_risk == ThreatSeverity.CRITICAL)
-        high = sum(1 for d in districts if d.outbreak_risk == ThreatSeverity.HIGH)
-        moderate = sum(1 for d in districts if d.outbreak_risk == ThreatSeverity.MODERATE)
-        stressed = sum(1 for d in districts if d.is_stressed)
+        hotspots = cls.get_all()
+        critical = sum(1 for d in hotspots if d.get("outbreak_risk") == "CRITICAL")
+        high = sum(1 for d in hotspots if d.get("outbreak_risk") == "HIGH")
+        moderate = sum(1 for d in hotspots if d.get("outbreak_risk") == "MODERATE")
         return {
-            "total_districts": len(districts),
+            "total_districts": len(hotspots),
             "critical_alert": critical,
             "high_alert": high,
             "moderate_alert": moderate,
-            "stressed_districts": stressed,
-            "active_reports": sum(d.reports_this_week for d in districts)
+            "active_reports": sum(d.get("reports_this_week", 0) for d in hotspots)
         }
-
 
 # ============================================================================
 # 9. GEMINI AI CROP DIAGNOSTIC SERVICE (FIX 6: real confidence scoring)
@@ -1765,7 +2555,7 @@ class AgriShieldWebHandler(http.server.BaseHTTPRequestHandler):
             results = IPMDecisionTree.search(q, crop, symptoms)
             self._send_json([{"protocol": asdict(p), "confidence": round(score, 1)} for p, score in results[:10]])
         elif path == "/api/hotspots":
-            self._send_json([asdict(d) for d in MaharashtraGISData.get_all()])
+            self._send_json(MaharashtraGISData.get_all())
         elif path == "/api/hotspot-stats":
             self._send_json(MaharashtraGISData.get_district_stats())
         elif path == "/api/reports":
@@ -1829,12 +2619,19 @@ class AgriShieldWebHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"success": False, "error": str(e)})
 
         elif parsed.path == "/api/auth/login":
-            token = AuthService.login(data.get("phone", ""), data.get("pin", ""))
-            if token:
+            try:
+                token = AuthService.login(data.get("phone", ""), data.get("pin", ""))
                 user = AuthService.get_session_user(token)
                 self._send_json({"success": True, "token": token, "role": user.role.value, "name": user.name, "district": user.district})
-            else:
-                self._send_json({"success": False, "error": "Invalid phone or PIN"})
+            except AuthError as e:
+                status = e.status_code
+                payload = json.dumps({"success": False, "error": "Invalid phone or PIN"}).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self._cors()
+                self.end_headers()
+                self.wfile.write(payload)
 
         elif parsed.path == "/api/diagnose":
             token = self._get_token()
@@ -1855,6 +2652,27 @@ class AgriShieldWebHandler(http.server.BaseHTTPRequestHandler):
                 farmer_id=farmer_id
             )
             self._send_json(asdict(res))
+
+        elif parsed.path == "/api/auth/change-pin":
+            token = self._get_token()
+            user = AuthService.get_session_user(token)
+            if not user:
+                self.send_response(401)
+                self._cors()
+                self.end_headers()
+                return
+            try:
+                AuthService.change_pin(user.user_id, data.get("newPin", ""), token)
+                self._send_json({"success": True, "message": "PIN changed successfully"})
+            except (AuthError, ValueError) as e:
+                payload = json.dumps({"success": False, "error": str(e)}).encode("utf-8")
+                status = e.status_code if isinstance(e, AuthError) else 400
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self._cors()
+                self.end_headers()
+                self.wfile.write(payload)
 
         elif parsed.path == "/api/reports/escalate":
             token = self._get_token()
@@ -2128,8 +2946,8 @@ def run_self_tests():
     total += 1
     districts = MaharashtraGISData.get_all()
     assert len(districts) >= 30, f"Expected 30+ districts, got {len(districts)}"
-    assert any(d.district_name == "Yavatmal" for d in districts)
-    assert any(d.district_name == "Nashik" for d in districts)
+    assert any(d.get("district_name") == "Yavatmal" for d in districts)
+    assert any(d.get("district_name") == "Nashik" for d in districts)
     passed += 1; print(f"  [PASS] GIS: {len(districts)} Maharashtra districts loaded")
 
     total += 1
