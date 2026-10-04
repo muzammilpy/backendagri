@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 AgriShield ml_engine.py
 =======================
@@ -162,14 +162,19 @@ class CottonDiseaseClassifier:
         else:
             top["localised_name"] = top["display_name"]
 
-        # Confidence interpretation
+        # Confidence interpretation & low confidence guard
         conf = top["confidence"]
         if conf >= 85:
             reliability = "HIGH — Strong visual match"
         elif conf >= 65:
             reliability = "MODERATE — Confirm with physical inspection"
-        else:
+        elif conf >= 45:
             reliability = "LOW — Seek expert validation"
+        else:
+            reliability = "UNRELIABLE — Image does not match known crop diseases with high confidence"
+            top["localised_name"] = "Unrecognised Specimen / Non-Plant Image"
+            top["display_name"] = "Unrecognised Specimen / Non-Plant Image"
+            top["immediate_action"] = "Please take a clear close-up photo of a crop leaf or pest lesion."
 
         return {
             "top_prediction":   top,
@@ -178,7 +183,7 @@ class CottonDiseaseClassifier:
             "farm_lat":         farm_lat,
             "farm_lon":         farm_lon,
             "language":         lang,
-            "model_source":     "AgriShield TFLite v1.0 (MobileNetV2 / Cotton)",
+            "model_source":     "AgriShield TFLite v1.0",
         }
 
 

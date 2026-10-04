@@ -14,6 +14,9 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 data class GeminiDiagnosis(
+    val isValidPlant: Boolean = true,
+    val rejectionReason: String = "",
+    val cropName: String = "Cotton",
     val diseaseName: String,
     val scientificName: String,
     val severity: Severity,
@@ -34,11 +37,12 @@ object GeminiService {
 
     /**
      * Sends the bitmap to Gemini Vision API and returns a specific disease diagnosis.
-     * Falls back gracefully if the API call fails.
+     * Validates if the image actually contains a plant/crop leaf first.
+     * Auto-detects the true crop species instead of assuming Cotton.
      */
     suspend fun diagnose(
         bitmap: Bitmap,
-        cropName: String = "Cotton",
+        cropName: String = "Auto-Detect",
         tfliteResult: String = "",
         lang: String = "en"
     ): GeminiDiagnosis? = withContext(Dispatchers.IO) {
@@ -57,19 +61,32 @@ object GeminiService {
                 else -> "Respond entirely in English."
             }
 
+            val isAutoDetect = cropName.isBlank() || cropName.equals("Auto-Detect", ignoreCase = true)
+
             val prompt = """
-                You are an expert plant pathologist for Maharashtra, India.
-                Analyze this $cropName leaf/plant image.
-                TFLite pre-screening result: $tfliteResult
+                You are an expert agricultural plant pathologist for Maharashtra, India.
+                Analyze this image.
+                Pre-screening info: ${if (isAutoDetect) "Auto-Detect crop from image" else cropName} (TFLite pre-screening: $tfliteResult)
                 $langInstruction
-                
-                Identify the SPECIFIC disease or pest. Be precise — do not say "diseased plant", 
-                say the actual disease name like "Pink Bollworm", "Late Blight", "Fusarium Wilt" etc.
-                
+
+                STEP 1: Determine if the image contains any plant, leaf, crop, fruit, stem, field vegetation, agricultural pest, or plant lesion.
+                Only reject the image if it is unequivocally non-agricultural/non-botanical (e.g. human faces, furniture, vehicles, indoor household electronics, paper documents, architecture diagrams, wall background).
+
+                If it is NOT a valid plant/crop image:
+                Set "isValidPlant": false and "rejectionReason": "⚠️ Diagnosis Failed: No plant or crop leaf detected. Please take a clear photo of an infected leaf or field specimen."
+
+                If it IS a valid plant/crop image:
+                Set "isValidPlant": true
+                Auto-detect the exact crop species (e.g. "Cotton", "Tomato", "Rice", "Wheat", "Maize", "Grape", "Potato", "Soybean", "Chilli", etc.).
+                Identify the SPECIFIC disease or pest (or "Healthy" if no infection).
+
                 Respond ONLY in this exact JSON format:
                 {
-                  "diseaseName": "specific disease or pest name",
-                  "scientificName": "scientific name",
+                  "isValidPlant": true,
+                  "rejectionReason": "",
+                  "cropName": "detected crop species name",
+                  "diseaseName": "specific disease or pest name or Healthy",
+                  "scientificName": "scientific pathogen name or None",
                   "severity": "LOW|MODERATE|HIGH|CRITICAL",
                   "confidencePercentage": 85,
                   "immediateAction": "specific action in 1-2 sentences",
@@ -128,6 +145,10 @@ object GeminiService {
                 .getString("text")
 
             val result = JSONObject(text)
+            val isValidPlant = result.optBoolean("isValidPlant", result.optBoolean("is_valid_plant", true))
+            val rejectionReason = result.optString("rejectionReason", result.optString("rejection_reason", ""))
+            val detectedCrop = result.optString("cropName", result.optString("crop_name", "Cotton"))
+
             val sevStr = result.optString("severity", "MODERATE").uppercase()
             val sev = try { Severity.valueOf(sevStr) } catch (e: Exception) { Severity.MODERATE }
 
@@ -137,13 +158,16 @@ object GeminiService {
             }
 
             GeminiDiagnosis(
-                diseaseName     = result.optString("diseaseName", "Unknown Disease"),
-                scientificName  = result.optString("scientificName", "Unknown"),
+                isValidPlant    = isValidPlant,
+                rejectionReason = rejectionReason,
+                cropName        = if (detectedCrop.isNotBlank()) detectedCrop else "Cotton",
+                diseaseName     = result.optString("diseaseName", result.optString("disease_name", "Unknown Disease")),
+                scientificName  = result.optString("scientificName", result.optString("scientific_name", "Unknown")),
                 severity        = sev,
-                confidence      = result.optInt("confidencePercentage", 80),
-                immediateAction = result.optString("immediateAction", "Consult local KVK."),
-                biologicalControl = result.optString("biologicalControl", "Apply NSKE 5%"),
-                chemicalControl = result.optString("chemicalControl", "Consult KVK for prescription"),
+                confidence      = result.optInt("confidencePercentage", result.optInt("confidence", 80)),
+                immediateAction = result.optString("immediateAction", result.optString("immediate_action", "Consult local KVK.")),
+                biologicalControl = result.optString("biologicalControl", result.optString("biological_control", "Apply NSKE 5%")),
+                chemicalControl = result.optString("chemicalControl", result.optString("chemical_control", "Consult KVK for prescription")),
                 preventionTips  = tips
             )
 

@@ -127,6 +127,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       <input type="file" id="fileIn" accept="image/*" capture="environment" style="display:none" onchange="handleImg(event)">
       <label id="uiLblCrop">Select Crop</label>
       <select id="dCrop">
+        <option value="Auto-Detect">Auto-Detect Crop</option>
         <option>Cotton</option><option>Tomato</option><option>Soybean</option>
         <option>Rice</option><option>Maize</option><option>Chilli</option>
         <option>Wheat</option><option>Tur (Pigeonpea)</option><option>Onion</option>
@@ -450,27 +451,32 @@ async function runDiag() {
 
 function getOfflineDiagnosis(crop, symptoms, district, lang) {
   const text = ((crop||'') + " " + (symptoms||'')).toLowerCase();
+  const isCottonSelected = (crop||'').toLowerCase() === "cotton";
+  const isSoybeanSelected = (crop||'').toLowerCase() === "soybean";
+  const isRiceSelected = (crop||'').toLowerCase() === "rice";
+  const isTomatoSelected = (crop||'').toLowerCase() === "tomato";
+
   let diag = "Foliar Fungal Infection", sci = "Alternaria spp.", sev = "MODERATE", conf = 78;
   let act = "Spray Mancozeb 75% WP @ 2.5g/L water. Improve field drainage.";
   let bio = ["Apply Trichoderma viride @ 5g/L", "Remove and burn infected leaves"];
   let chem = ["Mancozeb 75% WP (2.5g/L)", "Copper Oxychloride 50% WP (3g/L)"];
   
-  if (text.includes("rosetted") || text.includes("pink") || text.includes("boll") || (crop||'').toLowerCase().includes("cotton")) {
+  if (text.includes("rosetted") || text.includes("pink") || text.includes("boll") || isCottonSelected) {
     diag = "Pink Bollworm Infestation"; sci = "Pectinophora gossypiella"; sev = "CRITICAL"; conf = 85;
     act = "Install 2 Pheromone traps/acre. Spray Profenofos 50 EC @ 2ml/L if trap catch exceeds 8 moths/night.";
     bio = ["Release Trichogramma bactrae @ 60,000/acre", "Spray Neem seed kernel extract (NSKE 5%)"];
     chem = ["Profenofos 50 EC (2ml/L)", "Emamectin benzoate 5% SG (0.4g/L)"];
-  } else if (text.includes("yellow") || text.includes("mosaic") || (crop||'').toLowerCase().includes("soybean")) {
+  } else if (text.includes("yellow") || text.includes("mosaic") || isSoybeanSelected) {
     diag = "Yellow Mosaic Virus"; sci = "Mungbean yellow mosaic virus"; sev = "HIGH"; conf = 82;
     act = "Spray Thiamethoxam 25 WG @ 0.4g/L to control whitefly vectors. Destroy infected plants.";
     bio = ["Yellow sticky traps @ 10/acre", "Neem oil 10,000 ppm @ 3ml/L"];
     chem = ["Thiamethoxam 25 WG (0.4g/L)", "Imidacloprid 17.8 SL (0.5ml/L)"];
-  } else if (text.includes("blast") || text.includes("spindle") || (crop||'').toLowerCase().includes("rice")) {
+  } else if (text.includes("blast") || text.includes("spindle") || isRiceSelected) {
     diag = "Rice Leaf Blast"; sci = "Magnaporthe oryzae"; sev = "HIGH"; conf = 88;
     act = "Spray Tricyclazole 75 WP @ 0.6g/L. Avoid excess nitrogenous fertilizers.";
     bio = ["Pseudomonas fluorescens @ 10g/kg seed treatment", "Alternate wetting and drying"];
     chem = ["Tricyclazole 75 WP (0.6g/L)", "Isoprothiolane 40 EC (1.5ml/L)"];
-  } else if (text.includes("blight") || text.includes("water") || (crop||'').toLowerCase().includes("tomato")) {
+  } else if (text.includes("blight") || text.includes("water") || isTomatoSelected) {
     diag = "Late Blight"; sci = "Phytophthora infestans"; sev = "CRITICAL"; conf = 86;
     act = "Spray Cymoxanil + Mancozeb @ 2g/L immediately. Avoid overhead irrigation.";
     bio = ["Bio-fungicide Bacillus subtilis @ 5g/L", "Wide spacing for aeration"];
@@ -478,7 +484,8 @@ function getOfflineDiagnosis(crop, symptoms, district, lang) {
   }
   
   const repId = 'REP-OFFLINE-' + Math.floor(1000 + Math.random()*9000);
-  const rep = {report_id: repId, diagnosis: diag, scientific_name: sci, severity: sev, confidence: conf, immediate_action: act, biological_control: bio, chemical_control: chem, crop: crop||'Cotton', district: district||'Maharashtra', created_at: new Date().toLocaleDateString(), status: 'PENDING_VERIFICATION'};
+  const assignedCrop = (crop && crop !== "Auto-Detect") ? crop : "Auto-Detect";
+  const rep = {report_id: repId, diagnosis: diag, scientific_name: sci, severity: sev, confidence: conf, immediate_action: act, biological_control: bio, chemical_control: chem, crop: assignedCrop, district: district||'Maharashtra', created_at: new Date().toLocaleDateString(), status: 'PENDING_VERIFICATION'};
   
   try {
     const stored = JSON.parse(localStorage.getItem('ag_reports') || '[]');

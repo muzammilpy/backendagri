@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 =============================================================================
 AGRISHIELD MOBILE v4.0 - COMPETITION-GRADE CROP PROTECTION SYSTEM
@@ -2284,12 +2284,15 @@ class GeminiCropDiagnosticService:
         return res
 
     def _call_gemini(self, crop, variety, stage, soil, weather, symptoms, image_base64):
+        is_auto_detect = not crop or crop.lower() in ["auto-detect", "cotton", "unknown", ""]
+        crop_text = "Auto-Detect from image" if is_auto_detect else crop
         prompt = (
-            f"You are AgriShield's Senior Plant Pathologist for Maharashtra, India. Analyze:\n"
-            f"- Crop: {crop}, Variety: {variety}, Stage: {stage}, Soil: {soil}, Weather: {weather}\n"
-            f"- Symptoms: {symptoms}\n\n"
+            f"You are AgriShield's Senior Plant Pathologist for Maharashtra, India.\n"
+            f"Analyze this image. Pre-screening info: Crop: {crop_text}, Variety: {variety}, Stage: {stage}, Soil: {soil}, Weather: {weather}, Symptoms: {symptoms}\n\n"
+            "STEP 1: Determine if the image contains any plant, leaf, crop, fruit, stem, field vegetation, agricultural pest, or plant lesion.\n"
+            "Only reject the image if it is unequivocally non-agricultural/non-botanical (e.g. human face, furniture, vehicles, electronics, paper documents, architecture diagrams, room background).\n\n"
             "Respond ONLY in valid JSON matching this exact schema:\n"
-            '{"cropName":string,"diagnosis":string,"scientificName":string,"pathogenType":string,'
+            '{"isValidPlant":boolean,"rejectionReason":string,"cropName":string,"diagnosis":string,"scientificName":string,"pathogenType":string,'
             '"confidencePercentage":integer,"severity":"LOW"|"MODERATE"|"HIGH"|"CRITICAL",'
             '"symptomsIdentified":[string],"immediateAction":string,"culturalControl":[string],'
             '"biologicalControl":[string],"chemicalControl":[string],"organicAlternative":string,'
@@ -2313,18 +2316,44 @@ class GeminiCropDiagnosticService:
                     body = json.loads(resp.read().decode("utf-8"))
                     text = body["candidates"][0]["content"]["parts"][0]["text"]
                     parsed = json.loads(text)
+                    
+                    is_valid = parsed.get("isValidPlant", parsed.get("is_valid_plant", True))
+                    if not is_valid:
+                        rej = parsed.get("rejectionReason", "⚠️ Diagnosis Failed: No plant or crop leaf detected. Please take a clear photo of an infected crop leaf or field specimen.")
+                        return AIDiagnosisResponse(
+                            crop_name="Invalid Specimen",
+                            diagnosis="No Plant Detected",
+                            scientific_name="Non-botanical object",
+                            pathogen_type="None",
+                            confidence_percentage=0,
+                            severity=ThreatSeverity.LOW,
+                            symptoms_identified=[rej],
+                            immediate_action=rej,
+                            cultural_control=[],
+                            biological_control=[],
+                            chemical_control=[],
+                            organic_alternative="",
+                            prevention_tips=[],
+                            source=f"Gemini AI ({model})",
+                            match_score=0
+                        )
+
                     sev = ThreatSeverity.MODERATE
                     try:
                         sev = ThreatSeverity[parsed.get("severity", "MODERATE").upper()]
                     except KeyError:
                         pass
-                    # Cross-validate Gemini confidence with rule engine
+
                     gemini_conf = int(parsed.get("confidencePercentage", 80))
-                    _, rule_score = IPMDecisionTree.find_best_match(crop, symptoms)
-                    # Blend: 70% Gemini + 30% rule match (FIX 6)
+                    detected_crop = parsed.get("cropName", crop if not is_auto_detect else "Cotton")
+                    rule_score = 70
+                    try:
+                        _, rule_score = IPMDecisionTree.find_best_match(detected_crop, symptoms)
+                    except Exception:
+                        pass
                     blended_conf = int(gemini_conf * 0.7 + rule_score * 0.3)
                     return AIDiagnosisResponse(
-                        crop_name=parsed.get("cropName", crop),
+                        crop_name=detected_crop,
                         diagnosis=parsed.get("diagnosis", "Unknown"),
                         scientific_name=parsed.get("scientificName", "Unknown"),
                         pathogen_type=parsed.get("pathogenType", "Unknown"),
@@ -2640,7 +2669,7 @@ class AgriShieldWebHandler(http.server.BaseHTTPRequestHandler):
             farmer_name = user.name if user else "Guest Farmer"
             service = GeminiCropDiagnosticService()
             res = service.diagnose(
-                crop=data.get("crop", "Cotton"),
+                crop=data.get("crop", "Auto-Detect"),
                 variety=data.get("variety", "Hybrid"),
                 stage=data.get("stage", "Flowering"),
                 soil=data.get("soil", "Black Cotton Soil"),

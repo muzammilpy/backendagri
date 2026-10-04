@@ -149,13 +149,22 @@ class DiagnosisViewModel(application: Application) : AndroidViewModel(applicatio
                 // 3. Try Gemini Vision for specific disease identification (needs internet)
                 val geminiResult = GeminiService.diagnose(
                     bitmap       = bitmap,
-                    cropName     = "Cotton",
+                    cropName     = "Auto-Detect",
                     tfliteResult = top.displayName,
                     lang         = _language.value.code
                 )
 
+                if (geminiResult != null && !geminiResult.isValidPlant) {
+                    _diagState.value = DiagnosisState.Error(
+                        geminiResult.rejectionReason.ifBlank {
+                            "⚠️ Diagnosis Failed: No plant or crop leaf detected. Please take a clear photo of an infected leaf or field crop specimen."
+                        }
+                    )
+                    return@launch
+                }
+
                 // 4. Merge: use Gemini's specific diagnosis if available, TFLite as fallback
-                val finalPrediction = if (geminiResult != null) {
+                val finalPrediction = if (geminiResult != null && geminiResult.isValidPlant) {
                     top.copy(
                         displayName     = geminiResult.diseaseName,
                         label           = geminiResult.diseaseName,
@@ -168,14 +177,25 @@ class DiagnosisViewModel(application: Application) : AndroidViewModel(applicatio
                         marathi         = geminiResult.diseaseName,
                         hindi           = geminiResult.diseaseName
                     )
+                } else if (top.confidence < 45.0f) {
+                    top.copy(
+                        displayName     = "Unrecognized / Low Confidence Specimen",
+                        label           = "Uncertain Diagnosis",
+                        severity        = Severity.LOW,
+                        immediateAction = "The photo could not be matched to a known crop disease with sufficient confidence. Please provide a clear, well-lit close-up photo of a crop leaf or pest lesion.",
+                        biological      = "Ensure good lighting and focus on leaf lesions.",
+                        chemical        = "Consult local KVK or agronomy expert for physical verification.",
+                        marathi         = "अस्पष्ट नमुना / पुन्हा फोटो घ्या",
+                        hindi           = "अस्पष्ट नमूना / पुनः फोटो लें"
+                    )
                 } else {
                     top  // fallback to TFLite result
                 }
 
-                val sourceLabel = if (geminiResult != null)
-                    "Gemini 2.0 Flash Vision + TFLite v1.0"
+                val sourceLabel = if (geminiResult != null && geminiResult.isValidPlant)
+                    "Gemini 2.0 Flash Vision (${geminiResult.cropName}) + TFLite v1.0"
                 else
-                    "AgriShield TFLite v1.0 (MobileNetV2 / Cotton) — offline"
+                    "AgriShield TFLite v1.0 — offline"
 
                 // 5. Fetch weather for this exact farm GPS location
                 val currentWeather = _weather.value?.days?.firstOrNull()
@@ -194,7 +214,8 @@ class DiagnosisViewModel(application: Application) : AndroidViewModel(applicatio
 
                 // 5. Persist to Room DB (offline-first)
                 withContext(Dispatchers.IO) {
-                    persistDiagnosis(result, imageUri)
+                    val detectedCrop = geminiResult?.cropName ?: if (top.confidence >= 45.0f) "Cotton" else "Unknown Crop"
+                    persistDiagnosis(result, imageUri, detectedCrop)
                 }
 
                 _diagState.value = DiagnosisState.Success(result)
@@ -252,7 +273,7 @@ class DiagnosisViewModel(application: Application) : AndroidViewModel(applicatio
             ?: throw IllegalArgumentException("Could not decode image from $uri")
     }
 
-    private suspend fun persistDiagnosis(result: DiagnosisResult, imageUri: Uri) {
+    private suspend fun persistDiagnosis(result: DiagnosisResult, imageUri: Uri, cropName: String = "Cotton") {
         val id = generateReportId()
         val locState = _locationState.value
         val districtName = if (locState is LocationState.Available) locState.name else "Unknown"
@@ -267,7 +288,7 @@ class DiagnosisViewModel(application: Application) : AndroidViewModel(applicatio
             farmLon        = result.farmLon,
             districtName   = districtName,
             imagePath      = imagePath,
-            cropLabel      = "Cotton",
+            cropLabel      = cropName,
             diagnosisLabel = result.topPrediction.label,
             confidence     = result.topPrediction.confidence,
             severity       = result.topPrediction.severity.name,
